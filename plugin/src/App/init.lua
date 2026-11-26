@@ -744,71 +744,86 @@ function App:startSession()
 	end)
 
 	serveSession:setConfirmCallback(function(instanceMap, patch, serverInfo)
+		-- The agent's order covers this first sync only.
+		local agentOrdered = self.agentConnect
+		self.agentConnect = false
+		if agentOrdered then
+			self.agentRemovals = #patch.removed
+		end
+
 		if PatchSet.isEmpty(patch) then
 			Log.trace("Accepting patch without confirmation because it is empty")
 			return "Accept"
 		end
 
-		-- A connect ordered through the agent control service does not require confirmation
-		if self.agentConnect then
-			Log.trace("Accepting patch without confirmation because the agent control service ordered the connect")
-			return "Accept"
-		end
-
-		-- Play solo auto-connect does not require confirmation
-		if self:isAutoConnectPlaytestServerAvailable() then
-			Log.trace("Accepting patch without confirmation because play solo auto-connect is enabled")
-			return "Accept"
-		end
-
-		local confirmationBehavior = Settings:get("confirmationBehavior")
-		if confirmationBehavior == "Initial" then
-			-- Only confirm if we haven't synced this project yet this session
-			if self.knownProjects[serverInfo.projectName] then
-				Log.trace(
-					"Accepting patch without confirmation because project has already been connected and behavior is set to Initial"
-				)
+		-- A connect ordered through the agent control service skips confirmation only when the first sync
+		-- deletes nothing in Studio. A sync that would delete instances (Studio-only work under a synced
+		-- folder) falls through to the normal confirmation dialog, so a person decides.
+		if agentOrdered then
+			if not PatchSet.hasRemoves(patch) then
+				Log.trace("Accepting patch without confirmation because the agent control service ordered the connect")
 				return "Accept"
 			end
-		elseif confirmationBehavior == "Large Changes" then
-			-- Only confirm if the patch impacts many instances
-			if PatchSet.countInstances(patch) < Settings:get("largeChangesConfirmationThreshold") then
-				Log.trace(
-					"Accepting patch without confirmation because patch is small and behavior is set to Large Changes"
-				)
+			Log.info("Agent control: the first sync would delete {} instance(s); asking for confirmation", #patch.removed)
+		end
+
+		-- An agent-ordered sync that deletes instances always goes to the dialog, whatever the settings say.
+		if not agentOrdered then
+			-- Play solo auto-connect does not require confirmation
+			if self:isAutoConnectPlaytestServerAvailable() then
+				Log.trace("Accepting patch without confirmation because play solo auto-connect is enabled")
 				return "Accept"
 			end
-		elseif confirmationBehavior == "Unlisted PlaceId" then
-			-- Only confirm if the current placeId is not in the servePlaceIds allowlist
-			if serverInfo.expectedPlaceIds then
-				local isListed = table.find(serverInfo.expectedPlaceIds, game.PlaceId) ~= nil
-				if isListed then
+
+			local confirmationBehavior = Settings:get("confirmationBehavior")
+			if confirmationBehavior == "Initial" then
+				-- Only confirm if we haven't synced this project yet this session
+				if self.knownProjects[serverInfo.projectName] then
 					Log.trace(
-						"Accepting patch without confirmation because placeId is listed and behavior is set to Unlisted PlaceId"
+						"Accepting patch without confirmation because project has already been connected and behavior is set to Initial"
 					)
 					return "Accept"
 				end
-			end
-		elseif confirmationBehavior == "Never" then
-			Log.trace("Accepting patch without confirmation because behavior is set to Never")
-			return "Accept"
-		end
-
-		-- The datamodel name gets overwritten by Studio, making confirmation of it intrusive
-		-- and unnecessary. This special case allows it to be accepted without confirmation.
-		if
-			PatchSet.hasAdditions(patch) == false
-			and PatchSet.hasRemoves(patch) == false
-			and PatchSet.containsOnlyInstance(patch, instanceMap, game)
-		then
-			local datamodelUpdates = PatchSet.getUpdateForInstance(patch, instanceMap, game)
-			if
-				datamodelUpdates ~= nil
-				and next(datamodelUpdates.changedProperties) == nil
-				and datamodelUpdates.changedClassName == nil
-			then
-				Log.trace("Accepting patch without confirmation because it only contains a datamodel name change")
+			elseif confirmationBehavior == "Large Changes" then
+				-- Only confirm if the patch impacts many instances
+				if PatchSet.countInstances(patch) < Settings:get("largeChangesConfirmationThreshold") then
+					Log.trace(
+						"Accepting patch without confirmation because patch is small and behavior is set to Large Changes"
+					)
+					return "Accept"
+				end
+			elseif confirmationBehavior == "Unlisted PlaceId" then
+				-- Only confirm if the current placeId is not in the servePlaceIds allowlist
+				if serverInfo.expectedPlaceIds then
+					local isListed = table.find(serverInfo.expectedPlaceIds, game.PlaceId) ~= nil
+					if isListed then
+						Log.trace(
+							"Accepting patch without confirmation because placeId is listed and behavior is set to Unlisted PlaceId"
+						)
+						return "Accept"
+					end
+				end
+			elseif confirmationBehavior == "Never" then
+				Log.trace("Accepting patch without confirmation because behavior is set to Never")
 				return "Accept"
+			end
+
+			-- The datamodel name gets overwritten by Studio, making confirmation of it intrusive
+			-- and unnecessary. This special case allows it to be accepted without confirmation.
+			if
+				PatchSet.hasAdditions(patch) == false
+				and PatchSet.hasRemoves(patch) == false
+				and PatchSet.containsOnlyInstance(patch, instanceMap, game)
+			then
+				local datamodelUpdates = PatchSet.getUpdateForInstance(patch, instanceMap, game)
+				if
+					datamodelUpdates ~= nil
+					and next(datamodelUpdates.changedProperties) == nil
+					and datamodelUpdates.changedClassName == nil
+				then
+					Log.trace("Accepting patch without confirmation because it only contains a datamodel name change")
+					return "Accept"
+				end
 			end
 		end
 
@@ -852,14 +867,15 @@ function App:startAgentControl()
 			local status = self.state.appStatus
 			local project = if status == AppStatus.Connected then tostring(self.state.projectName or "") else ""
 			local url = string.format(
-				"%s/poll?placeId=%s&place=%s&status=%s&host=%s&port=%s&project=%s",
+				"%s/poll?placeId=%s&place=%s&status=%s&host=%s&port=%s&project=%s&removals=%s",
 				base,
 				tostring(game.PlaceId),
 				HttpService:UrlEncode(game.Name),
 				tostring(status),
 				HttpService:UrlEncode(tostring(host)),
 				HttpService:UrlEncode(tostring(port)),
-				HttpService:UrlEncode(project)
+				HttpService:UrlEncode(project),
+				tostring(self.agentRemovals or "")
 			)
 
 			local ok, response = pcall(function()
@@ -879,10 +895,15 @@ function App:startAgentControl()
 					self.setHost(tostring(order.host))
 					self.setPort(tostring(order.port))
 					self.agentConnect = true
+					self.agentRemovals = nil
 					self:startSession()
 				end
 			elseif order and order.action == "disconnect" then
-				if self.serveSession ~= nil then
+				if status == AppStatus.Confirming then
+					-- Same as pressing Abort in the confirmation dialog: nothing is applied.
+					Log.info("Agent control: aborting the pending connect")
+					self.confirmationBindable:Fire("Abort")
+				elseif self.serveSession ~= nil then
 					Log.info("Agent control: disconnecting")
 					self:endSession()
 				end
@@ -896,6 +917,7 @@ end
 
 function App:endSession()
 	self.agentConnect = false
+	self.agentRemovals = nil
 	if self.serveSession == nil then
 		return
 	end
