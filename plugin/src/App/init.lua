@@ -160,6 +160,10 @@ function App:init()
 		self:useRunningConnectionInfo()
 		self:startSession()
 	end
+
+	if RunService:IsEdit() then
+		self:startAgentControl()
+	end
 	self.autoConnectPlaytestServerListener = Settings:onChanged("autoConnectPlaytestServer", function(enabled)
 		if enabled then
 			if self:isAutoConnectPlaytestServerWriteable() and self.serveSession ~= nil then
@@ -174,6 +178,7 @@ function App:init()
 end
 
 function App:willUnmount()
+	self.agentControlStopped = true
 	self:endSession()
 
 	self.waypointConnection:Disconnect()
@@ -744,6 +749,12 @@ function App:startSession()
 			return "Accept"
 		end
 
+		-- A connect ordered through the agent control service does not require confirmation
+		if self.agentConnect then
+			Log.trace("Accepting patch without confirmation because the agent control service ordered the connect")
+			return "Accept"
+		end
+
 		-- Play solo auto-connect does not require confirmation
 		if self:isAutoConnectPlaytestServerAvailable() then
 			Log.trace("Accepting patch without confirmation because play solo auto-connect is enabled")
@@ -829,7 +840,62 @@ function App:startSession()
 	self.serveSession = serveSession
 end
 
+-- Agent control: polls a local service that an agent's CLI talks to, reports this Studio's sync
+-- state, and connects or disconnects when told. Does nothing if the service is not running.
+function App:startAgentControl()
+	local HttpService = game:GetService("HttpService")
+	local base = "http://localhost:34860"
+
+	task.spawn(function()
+		while not self.agentControlStopped do
+			local host, port = self:getHostAndPort()
+			local status = self.state.appStatus
+			local project = if status == AppStatus.Connected then tostring(self.state.projectName or "") else ""
+			local url = string.format(
+				"%s/poll?placeId=%s&place=%s&status=%s&host=%s&port=%s&project=%s",
+				base,
+				tostring(game.PlaceId),
+				HttpService:UrlEncode(game.Name),
+				tostring(status),
+				HttpService:UrlEncode(tostring(host)),
+				HttpService:UrlEncode(tostring(port)),
+				HttpService:UrlEncode(project)
+			)
+
+			local ok, response = pcall(function()
+				return HttpService:RequestAsync({ Url = url, Method = "GET" })
+			end)
+			local order = nil
+			if ok and response.Success then
+				local decoded, body = pcall(HttpService.JSONDecode, HttpService, response.Body)
+				if decoded and type(body) == "table" then
+					order = body
+				end
+			end
+
+			if order and order.action == "connect" then
+				if status == AppStatus.NotConnected or status == AppStatus.Error then
+					Log.info("Agent control: connecting to {}:{}", order.host, order.port)
+					self.setHost(tostring(order.host))
+					self.setPort(tostring(order.port))
+					self.agentConnect = true
+					self:startSession()
+				end
+			elseif order and order.action == "disconnect" then
+				if self.serveSession ~= nil then
+					Log.info("Agent control: disconnecting")
+					self:endSession()
+				end
+			end
+
+			-- Poll quickly while the service answers, slowly while it is absent.
+			task.wait(if ok then 1 else 6)
+		end
+	end)
+end
+
 function App:endSession()
+	self.agentConnect = false
 	if self.serveSession == nil then
 		return
 	end
